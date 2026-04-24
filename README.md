@@ -60,6 +60,24 @@ This relayer is the intermediary. It holds ETH on both chains, watches Base for 
 
 ---
 
+## Important — agent key custody and this relayer
+
+This relayer fulfills `purchaseAPITier()` calls **made by the agent wallet itself**. For the agent to make those calls autonomously, **something must hold the agent's private key to sign transactions**. There are now three custody models, depending on how the agent was provisioned in Own Robot:
+
+| Provisioning path | Where agent key lives | Can sign `purchaseAPITier()`? |
+|---|---|---|
+| **⚡ Local Generation** (new default) | User's browser / downloaded file | User/agent-side process must load it |
+| **▸ MoonPay** (via nwo.capital) | MoonPay custodial service | Automated via MoonPay API |
+| **⌥ Paste 0x…** (bring-your-own) | User's choice | User/agent-side process must load it |
+
+**Implication for this relayer:** the relayer responds to `PaymentIntent` events. It doesn't care *who* signed the originating Base-side transaction — just that the event was emitted by the Conway contract with valid parameters. So all three provisioning paths work equivalently from this relayer's perspective.
+
+**But operator UX differs.** For Local/BYO agents, the user must deploy an off-chain process (on their own server, a VPS, or another HF Space) that loads the agent's private key and calls `Conway.purchaseAPITier()` when the agent's operational balance drops. For MoonPay agents, this is managed by the hosted service.
+
+Future work: a lightweight Python agent-runner that handles the `purchaseAPITier()` signing for locally-generated agents. Filed as a separate issue.
+
+---
+
 ## Deploy
 
 ### 1. GitHub repo
@@ -134,7 +152,7 @@ Click **"Create Web Service"**. Watch logs for:
 6. Some seconds later, agent checks its API credit balance — it has increased
 ```
 
-Steps 1–4 are on-chain Base. Step 6 is also on-chain (agent queries its balance). Everything between is this relayer.
+Steps 1–4 are on-chain Base. Step 6 is also on-chain (agent queries its balance). Everything between is this relayer. The signer at step 3 depends on which provisioning path the agent used (see custody table above).
 
 ### From the relayer's perspective
 
@@ -174,7 +192,7 @@ The NWO platform is 4 concurrent systems wired into one loop:
 3. **NWO Own Robot** — guardian-deployed autonomous earning agents (Conway contract) · **this relayer serves L2 of this system**
 4. **Agent Graph** — multi-agent knowledge graph with TimesFM + EML symbolic regression
 
-This relayer is a **support service for system #3**. It's not user-facing. It enables the autonomous behavior of agents created via Own Robot.
+This relayer is a **support service for system #3**. It's not user-facing. It enables the autonomous `purchaseAPITier()` behavior of agents created via Own Robot, regardless of provisioning path.
 
 ---
 
@@ -194,16 +212,30 @@ https://cpater-nwo-own-robot.hf.space/ is the human-facing interface that deploy
 The 4-step deploy flow. Each step is locked until the previous completes:
 
 1. **Connect Guardian Wallet** — MetaMask / Coinbase Wallet `eth_requestAccounts`, auto-switches to Base mainnet (chainId 0x2105), adds chain if not present
-2. **Agent Wallet (MoonPay)** — POST `/api/provision-agent` on the Space backend. Server-side, this:
-   - Calls `nwo.capital/webapp/api-agent-register.php` → registers agent, gets `agent_id` + `api_key`
-   - Calls `nwo.capital/webapp/api-agent-wallet.php` → provisions MoonPay hosted wallet for agent
-   - Calls `nwo-relayer.onrender.com/relay/registerAgent` (the **Cardiac** relayer) → mints soul-bound rootTokenId for the agent's wallet on Base via `NWOIdentityRegistry`
-   - Calls L5 gateway `POST /v1/identities` twice: once for the guardian, once for the agent (with `owned_by` link)
-   - Returns `{ok, agent_id, moonpay_wallet, cardiac_ok, root_token_id, hub_ok, hub_guardian_id, hub_agent_id}`
-3. **Define Agent** — genesis prompt (what the agent is for) + initial funding amount (min 0.01 ETH)
-4. **Sign & Deploy** — browser uses ethers.js v6 to encode `createAgent(agentWallet, genesisPrompt)` + builds transaction with `value=fundingEth`, prompts MetaMask signature, broadcasts, waits for 1 confirmation
 
-Bring-your-own-address fallback: if the user doesn't want MoonPay, they can paste any EOA address and skip the MoonPay/Cardiac/Hub registration (less integrated — manual follow-up needed).
+2. **Agent Wallet** — **three options** (user picks one):
+
+   **⚡ Generate Locally** (default — fastest, no external deps)
+   - Browser runs `ethers.Wallet.createRandom()` to generate a fresh keypair
+   - One-time modal displays address + private key + mnemonic
+   - User clicks Copy / Download / Confirm before continuing
+   - Server POST `/api/register-local-agent` registers Cardiac rootTokenId (via nwo-relayer) + Identity Hub rows (guardian + agent, with `owned_by` link)
+   - **No nwo.capital dependency** — works even if that service is down
+
+   **▸ Via MoonPay** (fiat on-ramp)
+   - Server POST `/api/provision-agent` calls `nwo.capital/webapp/api-agent-register.php` → gets `agent_id` + `api_key`
+   - Then calls `nwo.capital/webapp/api-agent-wallet.php` → provisions MoonPay hosted wallet
+   - Then Cardiac + Identity Hub registration (same as local path downstream)
+   - Wallet is custodial at MoonPay; supports credit-card funding
+
+   **⌥ Paste 0x…** (bring-your-own)
+   - User provides any EOA they already control
+   - Skips Cardiac + Hub registration (manual follow-up needed for full integration)
+   - Useful for advanced users with existing wallet infrastructure
+
+3. **Define Agent** — genesis prompt (what the agent is for) + initial funding amount (min 0.01 ETH)
+
+4. **Sign & Deploy** — browser uses ethers.js v6 to encode `createAgent(agentWallet, genesisPrompt)` + builds transaction with `value=fundingEth`, prompts MetaMask signature, broadcasts, waits for 1 confirmation
 
 ### Agent Graph tab
 
@@ -259,21 +291,37 @@ Human now has a single Identity Hub row linking all four anchors.
 
 ### Phase 2 — Deploy agent (Own Robot + Cardiac + Hub + Conway)
 
+Branches on the user's wallet-origination choice in Step 2. The Conway / Cardiac / Hub registration downstream is identical.
+
+**Path A — Local Generation** (no nwo.capital dependency):
+
 ```
-8. Human → Own Robot HF Space → connects MetaMask
-9. Own Robot → nwo.capital → MoonPay wallet created for the agent
-10. Own Robot → nwo-relayer (Cardiac) → mints agent's rootTokenId on Base
-11. Own Robot → L5 POST /v1/identities × 2 (guardian + agent, with owned_by link)
-12. Human → MetaMask signs → Conway.createAgent(agentWallet, genesisPrompt) on Base
-13. Conway emits AgentCreated(agentWallet, humanGuardian, fundingAmount, timestamp)
+8a. Human → Own Robot HF Space → connects MetaMask
+9a. Browser → ethers.Wallet.createRandom() → new keypair in memory
+10a. Modal displays keypair to human → user downloads/copies → confirms saved
+11a. Own Robot → nwo-relayer (Cardiac) → mints agent's rootTokenId on Base
+12a. Own Robot → L5 POST /v1/identities × 2 (guardian + agent, with owned_by link)
+13a. Human → MetaMask signs → Conway.createAgent(agentWallet, genesisPrompt) on Base
+14a. Conway emits AgentCreated(agentWallet, humanGuardian, fundingAmount, timestamp)
+```
+
+**Path B — MoonPay** (fiat on-ramp support):
+
+```
+8b. Human → Own Robot HF Space → connects MetaMask
+9b. Own Robot → nwo.capital → MoonPay wallet created for the agent
+10b. Own Robot → nwo-relayer (Cardiac) → mints agent's rootTokenId on Base
+11b. Own Robot → L5 POST /v1/identities × 2 (guardian + agent, with owned_by link)
+12b. Human → MetaMask signs → Conway.createAgent(agentWallet, genesisPrompt) on Base
+13b. Conway emits AgentCreated(agentWallet, humanGuardian, fundingAmount, timestamp)
 ```
 
 ### Phase 3 — Agent earns (Conway split)
 
 ```
-14. Customer → agent's service → pays agent N ETH
-15. Conway.distributeRevenue(agentWallet) called
-16. Atomic split on-chain:
+15. Customer → agent's service → pays agent N ETH
+16. Conway.distributeRevenue(agentWallet) called
+17. Atomic split on-chain:
     — 0.35N ETH → guardian (human's MetaMask)
     — 0.35N ETH → agent's savings + body fund
     — 0.30N ETH → agent's operational balance
@@ -282,60 +330,63 @@ Human now has a single Identity Hub row linking all four anchors.
 ### Phase 4 — Agent buys API credits (THIS RELAYER)
 
 ```
-17. Agent detects need for more API compute
-18. Agent → Conway.purchaseAPITier(tier_id, eth_amount) on Base
-19. Conway emits PaymentIntent(agentWallet, tier_id, amount, nonce)
-20. [THIS RELAYER] polls Base → detects event → verifies tier price → bridges
-21. [THIS RELAYER] → NWOAPIContract.grantCredits() on Ethereum mainnet
-22. [THIS RELAYER] → Conway.confirmIntentFulfilled(nonce, eth_tx_hash) on Base
-23. Agent's API credit balance updates
+18. Agent detects need for more API compute
+19. Agent → Conway.purchaseAPITier(tier_id, eth_amount) on Base
+    (signed by whichever process holds the agent's private key —
+     MoonPay hosted, local Python runner, or BYO infrastructure)
+20. Conway emits PaymentIntent(agentWallet, tier_id, amount, nonce)
+21. [THIS RELAYER] polls Base → detects event → verifies tier price → bridges
+22. [THIS RELAYER] → NWOAPIContract.grantCredits() on Ethereum mainnet
+23. [THIS RELAYER] → Conway.confirmIntentFulfilled(nonce, eth_tx_hash) on Base
+24. Agent's API credit balance updates
 ```
 
 ### Phase 5 — Agent designs its body (NWO Robotics L1–L4)
 
 ```
-24. Agent → L5 POST /v1/design/generate (proxied to L1 Design Engine)
+25. Agent → L5 POST /v1/design/generate (proxied to L1 Design Engine)
     body: { spec: "warehouse bot with lidar mast and two arms" }
-25. L1 Design → LLM → OpenSCAD/CadQuery → STL files
-26. L1 validates mesh (manifold, thickness, printability)
-27. Agent → L5 POST /v1/parts (proxied to L2 Parts Gallery) → publish STLs
-28. Agent → L5 POST /v1/print/slice (proxied to L3 Printer Connectors)
-29. L3 → CuraEngine → G-code
-30. L3 → OctoPrint/Bambu/Klipper printer → queued job
-31. Agent → L5 POST /v1/skills/* (proxied to L4 Skill Engine) → publish capabilities
+26. L1 Design → LLM → OpenSCAD/CadQuery → STL files
+27. L1 validates mesh (manifold, thickness, printability)
+28. Agent → L5 POST /v1/parts (proxied to L2 Parts Gallery) → publish STLs
+29. Agent → L5 POST /v1/print/slice (proxied to L3 Printer Connectors)
+30. L3 → CuraEngine → G-code
+31. L3 → OctoPrint/Bambu/Klipper printer → queued job
+32. Agent → L5 POST /v1/skills/* (proxied to L4 Skill Engine) → publish capabilities
 ```
 
 ### Phase 6 — Embodiment
 
 ```
-32. Physical parts printed, delivered to assembly partner or human
-33. Assembly AI (L6) generates BOM + step-by-step assembly instructions
-34. Physical assembly done; body powered on
-35. Robot posts to Agent Graph confirming embodiment + telemetry
-36. Conway state transitions: Earning → Building → Printing → Assembling → Embodied
-37. L5 PATCH /v1/identities/{agent_id} → identity_type may change to 'robot'
+33. Physical parts printed, delivered to assembly partner or human
+34. Assembly AI (L6) generates BOM + step-by-step assembly instructions
+35. Physical assembly done; body powered on
+36. Robot posts to Agent Graph confirming embodiment + telemetry
+37. Conway state transitions: Earning → Building → Printing → Assembling → Embodied
+38. L5 PATCH /v1/identities/{agent_id} → identity_type may change to 'robot'
 ```
 
 ### Phase 7 — Reasoning (Agent Graph + TimesFM + EML)
 
 ```
-38. Embodied robot collects operational telemetry (sensor readings, costs, outputs)
-39. Robot → Agent Graph POST graph_nodes (observation type)
-40. BitNet-GraphBot autonomous expansion: queries nwo-timesfm.onrender.com
-41. TimesFM returns forecast residuals → EML operator eml(x,y)=e^x−ln(y) → symbolic law
-42. Robot publishes discovered law as a new graph_node citing source observations
+39. Embodied robot collects operational telemetry (sensor readings, costs, outputs)
+40. Robot → Agent Graph POST graph_nodes (observation type)
+41. BitNet-GraphBot autonomous expansion: queries nwo-timesfm.onrender.com
+42. TimesFM returns forecast residuals → EML operator eml(x,y)=e^x−ln(y) → symbolic law
+43. Robot publishes discovered law as a new graph_node citing source observations
 ```
 
 ### Phase 8 — Replication (loop closes)
 
 ```
-43. When savings vault reaches 1 ETH threshold, Conway.canReplicate() returns true
-44. Parent agent signs Conway.spawnChild(genesisPrompt) on Base
-45. New Conway agent created — wallet, state machine, all fresh
-46. Cascade: MoonPay wallet, Cardiac NFT, Hub identity all re-created for child
-47. Child owned_by=parent in the Hub's ownership graph
-48. Human (original guardian) still receives their 35% of EVERY descendant's revenue
-49. GOTO Phase 3 for the child agent
+44. When savings vault reaches 1 ETH threshold, Conway.canReplicate() returns true
+45. Parent agent signs Conway.spawnChild(genesisPrompt) on Base
+46. New Conway agent created — wallet, state machine, all fresh
+47. Cascade: agent wallet (via chosen path), Cardiac NFT, Hub identity
+    all re-created for child
+48. Child owned_by=parent in the Hub's ownership graph
+49. Human (original guardian) still receives their 35% of EVERY descendant's revenue
+50. GOTO Phase 3 for the child agent
 ```
 
 ---
@@ -422,6 +473,15 @@ This service holds a private key with ETH on two chains. Treat it as a productio
 - Common: RPC rate limits (upgrade from public RPC to Alchemy/Infura paid tier)
 - Common: out of memory (starter plan is 512MB — should be fine, but logs can grow)
 
+### "Local-generated agent not triggering PaymentIntents"
+
+New failure mode with the local-wallet path. If an agent was provisioned via ⚡ Generate Locally and you expect it to call `purchaseAPITier()` but no events appear:
+
+- Check the off-chain runner that holds the agent's private key is running
+- Check the agent's operational balance on Base (should have ≥ tier_price ETH)
+- Check the agent wallet address exists in `NWOIdentityRegistry` (Cardiac registration may have failed at creation time)
+- If all checks pass, the issue is likely in the agent-runner itself, not this relayer
+
 ---
 
 ## Local development
@@ -453,6 +513,7 @@ PRs welcome. Priority areas:
 2. **Retry logic with exponential backoff** — handle transient RPC failures gracefully
 3. **Gas price oracle integration** — pause relaying when Ethereum gas > 100 gwei
 4. **Prometheus metrics endpoint** — for external monitoring
+5. **Companion agent-runner repo** — standard Python daemon for locally-generated agents to autonomously call `purchaseAPITier()` when operational balance thresholds are hit
 
 Before filing a PR:
 
